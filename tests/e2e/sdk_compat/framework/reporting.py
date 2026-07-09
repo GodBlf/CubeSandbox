@@ -19,3 +19,6 @@ class JsonlReporter:
         payload = {"ts": time.time(), "event": event, **fields}
         with self._path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def record_test_result(self, **fields: Any) -> None:
+        self.record("test_result", **fields)

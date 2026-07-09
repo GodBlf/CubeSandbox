@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import requests
 
 from framework.config import SdkE2EConfig
@@ -14,6 +16,21 @@ class ApiClient:
     def __init__(self, config: SdkE2EConfig) -> None:
         self._config = config
         self._session = requests.Session()
+        api_key = os.environ.get("CUBE_API_KEY")
+        if api_key:
+            self._session.headers.update({"Authorization": f"Bearer {api_key}"})
+
+    def health(self) -> dict:
+        resp = self._session.get(f"{self._config.cube_api_url}/health")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_template(self, template_id: str) -> dict:
+        resp = self._session.get(f"{self._config.cube_api_url}/templates/{template_id}")
+        if resp.status_code == 404:
+            return {}
+        resp.raise_for_status()
+        return resp.json()
 
     def delete_sandbox(self, sandbox_id: str) -> None:
         resp = self._session.delete(f"{self._config.cube_api_url}/sandboxes/{sandbox_id}")

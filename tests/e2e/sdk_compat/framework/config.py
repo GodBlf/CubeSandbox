@@ -45,7 +45,7 @@ class SdkE2EConfig:
         cube_template_id: str | None = None,
     ) -> "SdkE2EConfig":
         selected_backends = tuple(
-            _csv(backends or os.environ.get("SDK_E2E_BACKENDS", "e2b,cubesandbox"))
+            _csv(backends or os.environ.get("SDK_E2E_BACKENDS", "cubesandbox"))
         )
         resolved_cube_api_url = (
             cube_api_url or os.environ.get("CUBE_API_URL") or "http://127.0.0.1:3000"

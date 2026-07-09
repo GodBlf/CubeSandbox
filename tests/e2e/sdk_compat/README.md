@@ -7,12 +7,14 @@ through multiple Python SDKs:
 - `e2b`: E2B Python SDK (`e2b-code-interpreter` or `e2b`) against the same CubeSandbox-compatible backend.
 
 The suite is opt-in. Test collection is safe by default and all cases are skipped
-unless `--run-e2e` is passed.
+unless `--run-e2e` is passed. Live runs default to the `cubesandbox` backend;
+set `SDK_E2E_BACKENDS=e2b,cubesandbox` or pass `--sdk-e2e-backends` for dual SDK
+compatibility runs.
 
 ## Layout
 
 - `adapters/`: SDK-specific shims that expose a small shared test surface.
-- `framework/`: configuration, capability flags, cleanup, assertions, and reporting helpers.
+- `framework/`: configuration, preflight checks, capability flags, cleanup, assertions, and reporting helpers.
 - `cases/`: backend-neutral test cases, split by SDK capability domain.
 - `reports/`: local JSONL execution events. This directory is ignored by Git.
 
@@ -62,7 +64,6 @@ export SDK_E2E_BACKENDS=cubesandbox
 export CUBE_API_URL=http://10.0.1.5:3000
 export CUBE_TEMPLATE_ID=tpl-xxxxxxxxxxxxxxxxxxxxxxxx
 export CUBE_PROXY_NODE_IP=10.0.1.2
-export SDK_E2E_E2B_INSECURE_TLS=true
 pytest --run-e2e
 ```
 
@@ -107,6 +108,20 @@ pytest --run-e2e
 For local test environments where the CA is unavailable, use
 `SDK_E2E_E2B_INSECURE_TLS=true` as a fallback.
 
+## Preflight
+
+When `--run-e2e` is enabled, the suite runs a session preflight before creating
+per-test sandboxes:
+
+- `CUBE_TEMPLATE_ID` or `--cube-template-id` is present.
+- `GET /health` on `CUBE_API_URL` is reachable.
+- `GET /templates/{template_id}` returns the selected template.
+- If the template response exposes `status` or `state`, it must be ready-like
+  (`ready`, `active`, or `available`).
+
+Preflight failures are recorded in `reports/sdk-dual/events.jsonl` as
+`preflight_failed` and stop the run early with a single diagnostic message.
+
 You can also pass options instead of environment variables:
 
 ```bash
@@ -125,6 +140,20 @@ pytest --run-e2e \
 - `CUBE_SANDBOX_DOMAIN`: defaults to `cube.app`.
 - `SSL_CERT_FILE`: optional CA bundle path for self-hosted sandbox HTTPS certificates, for example `/root/.local/share/mkcert/rootCA.pem`.
 - `SDK_E2E_E2B_INSECURE_TLS`: disables TLS certificate verification for the E2B SDK sandbox transport. Prefer `SSL_CERT_FILE` when the local CA is available. This option defaults to `true` when `CUBE_API_URL` starts with `http://`, which matches local/self-hosted CubeSandbox test deployments.
+
+## Reporting
+
+The suite writes JSONL events to `SDK_E2E_REPORT_DIR/events.jsonl`, defaulting to
+`reports/sdk-dual/events.jsonl`.
+
+Current event types:
+
+- `preflight_passed` / `preflight_failed`: live environment readiness checks.
+- `sandbox_created`: sandbox ID, backend, and pytest node ID.
+- `sandbox_cleanup` / `sandbox_kept`: teardown outcome.
+- `test_result`: pytest phase, outcome, duration, backend, sandbox ID, and failure
+  diagnostics. Failed test results include `error` and best-effort
+  `sandbox_info` when available.
 
 ## Cleanup
 

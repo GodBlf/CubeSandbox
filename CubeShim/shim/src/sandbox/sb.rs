@@ -842,10 +842,12 @@ impl SandBox {
     }
 
     async fn finish_destroy(&mut self, result: CResult<()>) -> CResult<()> {
-        // A worker panic does not prove VMM death. Keep the handle so a later
-        // terminal cleanup can retry, but make the sandbox unavailable and
-        // notify waiters regardless. Callers must not mark cleanup complete
-        // until the VMM join was confirmed by a successful result.
+        // A worker panic does not prove VMM death. Retain the runtime handle:
+        // dropping it can block in VmmInstance::drop. Production callers signal
+        // shim exit instead of retrying; the watchdog bounds any stalled exit.
+        // Notify waiters deliberately because the sandbox is terminal and
+        // unavailable, even when VMM death remains unconfirmed. Callers must not
+        // mark cleanup complete until a successful result confirms the join.
         if result.is_ok() {
             self.ch = None;
         }
@@ -1956,7 +1958,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_failure_finalizes_state_but_keeps_runtime_for_retry() {
+    async fn worker_failure_finalizes_state_and_retains_unconfirmed_runtime() {
         let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(8);
         let mut sb = SandBox::new("failed-worker".into(), Log::default(), false, tx);
         assert!(sb

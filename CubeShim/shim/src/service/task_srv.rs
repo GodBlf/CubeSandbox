@@ -359,7 +359,13 @@ impl TaskService {
             return Ok(api::Empty::default());
         }
         if let Some(probe) = probe {
-            probe.commit();
+            if let Err(e) = probe.commit(timeout) {
+                warnf!(
+                    self.log,
+                    "cannot start terminal cleanup watchdog:{}; continuing cleanup",
+                    e
+                );
+            }
         } else {
             self.arm_deadline();
         }
@@ -407,6 +413,7 @@ impl TaskService {
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
     #[tokio::test]
@@ -414,6 +421,9 @@ mod cleanup_tests {
         let Ok(mode) = std::env::var("CUBE_SHIM_ROLLBACK_TEST") else {
             return;
         };
+        std::io::stdout()
+            .write_all(b"rollback-child-started\n")
+            .unwrap();
         let (tx, _) = channel(8);
         let service = TaskService {
             sandbox: Arc::new(Mutex::new(sb::SandBox::new(
@@ -445,6 +455,22 @@ mod cleanup_tests {
             // Simulate a stalled shim exit sequence after successful cleanup.
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
+        if mode == "shutdown-refresh" {
+            let guard = service.sandbox.lock().await;
+            let cloned = service.clone();
+            let shutdown = tokio::spawn(async move {
+                cloned
+                    .shutdown_sandbox(Duration::from_millis(500))
+                    .await
+                    .unwrap();
+            });
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(guard);
+            shutdown.await.unwrap();
+            // Past the lock-wait deadline but within the fresh cleanup budget.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            std::process::exit(0);
+        }
         // Shorten only the child test's deadline. The production rollback must
         // keep this first deadline even if Shutdown races with it.
         service.terminating.arm(Duration::from_secs(2)).unwrap();
@@ -464,6 +490,7 @@ mod cleanup_tests {
             ("blocked", 1),
             ("shutdown-blocked", 1),
             ("shutdown-clean", 0),
+            ("shutdown-refresh", 0),
         ] {
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -471,12 +498,23 @@ mod cleanup_tests {
                     "service::task_srv::cleanup_tests::rollback_child",
                 ])
                 .env("CUBE_SHIM_ROLLBACK_TEST", mode)
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
             let start = Instant::now();
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
+                    let mut output = String::new();
+                    child
+                        .stdout
+                        .take()
+                        .unwrap()
+                        .read_to_string(&mut output)
+                        .unwrap();
+                    assert!(
+                        output.contains("rollback-child-started"),
+                        "child harness did not execute the selected test"
+                    );
                     assert_eq!(status.code(), Some(code), "{mode}");
                     break;
                 }

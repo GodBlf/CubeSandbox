@@ -26,7 +26,6 @@ impl Deadline {
         let probe = Probe {
             active: active.clone(),
             deadline: self.clone(),
-            committed: false,
         };
         let deadline = self.clone();
         std::thread::Builder::new()
@@ -72,6 +71,8 @@ impl Deadline {
         let deadline = self.clone();
         spawn(Box::new(move || {
             std::thread::sleep(timeout);
+            // Do not flush the VMM logger either: Logger::log_flush takes its
+            // buffer mutex and writes to its output, which can block forever.
             // Do not run destructors/atexit handlers: VmmInstance::drop can
             // block on the same VMM API or join that prevented cleanup.
             // Exiting the whole process closes the embedded VM's descriptors
@@ -89,27 +90,27 @@ impl Deadline {
 pub(super) struct Probe {
     active: Arc<AtomicBool>,
     deadline: Arc<Deadline>,
-    committed: bool,
 }
 
 impl Probe {
-    pub(super) fn commit(mut self) {
-        self.deadline.armed.store(true, Ordering::SeqCst);
-        self.committed = true;
+    /// Lock checks have finished. Cancel their watchdog and give teardown its
+    /// own full budget. An already armed rollback keeps its original deadline.
+    pub(super) fn commit(self, timeout: Duration) -> std::io::Result<()> {
+        self.active.store(false, Ordering::SeqCst);
+        self.deadline.arm(timeout)
     }
 }
 
 impl Drop for Probe {
     fn drop(&mut self) {
-        if !self.committed {
-            self.active.store(false, Ordering::SeqCst);
-        }
+        self.active.store(false, Ordering::SeqCst);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
@@ -118,8 +119,13 @@ mod tests {
         let Ok(mode) = std::env::var("CUBE_SHIM_DEADLINE_TEST") else {
             return;
         };
+        // Re-exec requires the libtest --exact protocol. The parent checks this
+        // marker so an incompatible harness running zero tests cannot pass.
+        std::io::stdout()
+            .write_all(b"deadline-child-started\n")
+            .unwrap();
         let terminating = Arc::new(Deadline::default());
-        if mode == "cancel-probe" || mode == "commit-probe" {
+        if mode == "cancel-probe" || mode == "commit-probe" || mode == "refresh-probe" {
             let probe = terminating.probe(Duration::from_millis(100)).unwrap();
             if mode == "cancel-probe" {
                 drop(probe);
@@ -127,8 +133,18 @@ mod tests {
                 assert!(!terminating.is_armed());
                 std::process::exit(0);
             }
-            probe.commit();
+            probe
+                .commit(if mode == "refresh-probe" {
+                    Duration::from_millis(400)
+                } else {
+                    Duration::from_millis(100)
+                })
+                .unwrap();
             assert!(terminating.is_armed());
+            if mode == "refresh-probe" {
+                std::thread::sleep(Duration::from_millis(250));
+                std::process::exit(0);
+            }
             std::thread::sleep(Duration::from_secs(60));
         }
         terminating.arm(Duration::from_millis(100)).unwrap();
@@ -152,12 +168,23 @@ mod tests {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "service::termination::tests::deadline_child"])
             .env("CUBE_SHIM_DEADLINE_TEST", mode)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
         let start = Instant::now();
         loop {
             if let Some(status) = child.try_wait().unwrap() {
+                let mut output = String::new();
+                child
+                    .stdout
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut output)
+                    .unwrap();
+                assert!(
+                    output.contains("deadline-child-started"),
+                    "child harness did not execute the selected test"
+                );
                 return status;
             }
             if start.elapsed() > Duration::from_secs(5) {
@@ -182,9 +209,10 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_probe_can_cancel_or_commit_without_extending_deadline() {
+    fn shutdown_probe_can_cancel_or_start_a_fresh_cleanup_budget() {
         assert_eq!(run_child("cancel-probe").code(), Some(0));
         assert_eq!(run_child("commit-probe").code(), Some(1));
+        assert_eq!(run_child("refresh-probe").code(), Some(0));
     }
 
     #[test]

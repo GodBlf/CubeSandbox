@@ -308,11 +308,6 @@ impl CubeHypervisor {
         Err("VM shutdown event deadline expired".into())
     }
 
-    pub async fn join(&mut self) -> CResult<()> {
-        let mut ch = self.ch.as_mut().unwrap().lock().await;
-        ch.join().map_err(|e| format!("join ch failed:{}", e))
-    }
-
     /// Terminal teardown, including a VM whose agent was never connected.
     /// VmmShutdown stops the VMM event loop; VmShutdown only stops the guest.
     pub async fn shutdown(&mut self) -> CResult<()> {

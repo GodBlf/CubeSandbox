@@ -766,62 +766,43 @@ impl SandBox {
             infof!(self.log, "ch instance is None");
             return Ok(());
         }
-        let mut ch = self.ch.as_mut().unwrap().lock().await;
-        //In the context of this 'ch' lock, check whether the VmShutdown event has been received
-        {
-            let state = self.state.lock().await;
-            if *state == SandBoxState::Exited {
-                infof!(self.log, "vm has exited");
-                return Ok(());
-            }
+        // Stop competing event consumers before waiting for VmShutdown.
+        if let Some(handle) = self.monitor_handle.take() {
+            handle.abort();
         }
-        if self.client.is_none() {
-            infof!(self.log, "client is None");
-            return Ok(());
+        if let Some(handle) = self.oom_handle.take() {
+            handle.abort();
         }
-        let client = self.client.as_ref().unwrap().lock().await;
-
-        if let Err(e) = client
-            .destroy_sandbox(context::with_timeout(1000 * 1000 * 200), &req)
-            .await
-        {
-            //perhaps the VM has already shutdown.(eg:panic/cube-agent exited/...)
-            warnf!(self.log, "destroy sandbox failed:{}, but nothing to do", e)
-        }
-
-        infof!(self.log, "wait vm shutdown");
-
-        //wait for the vm shutdown gracefully
-        loop {
-            match ch.wait_notify(Duration::from_millis(1000)).await {
-                Ok(ev) => {
-                    if CH::NotifyEvent::VmShutdown != ev {
-                        warnf!(
-                            self.log,
-                            "Not an expected event, expected:{:?}, actual:{:?}",
-                            CH::NotifyEvent::VmShutdown,
-                            ev
-                        );
-                        continue;
+        let mut ch = self.ch.as_ref().unwrap().lock().await;
+        let exited = *self.state.lock().await == SandBoxState::Exited;
+        if !exited {
+            // A failed connect_agent leaves no client but can still leave a
+            // running VM. Agent cleanup is best effort, never a prerequisite
+            // for stopping the embedded VMM below.
+            if let Some(client) = self.client.as_ref() {
+                let client = client.lock().await;
+                if let Err(e) = client
+                    .destroy_sandbox(context::with_timeout(1000 * 1000 * 200), &req)
+                    .await
+                {
+                    warnf!(self.log, "destroy guest sandbox failed:{}", e);
+                }
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    match ch.wait_notify(remaining).await {
+                        Ok(CH::NotifyEvent::VmShutdown) => break,
+                        Ok(_) => continue,
+                        Err(e) => {
+                            warnf!(self.log, "wait vm shutdown failed:{}, stopping VMM", e);
+                            break;
+                        }
                     }
-                    break;
-                }
-
-                //we are in the process of destruction, so the results here are not important.
-                Err(e) => {
-                    warnf!(
-                        self.log,
-                        "wait vm shutdown event failed:{}, but nothing to do",
-                        e
-                    );
-                    break;
                 }
             }
         }
-        infof!(self.log, "wait ch exit");
-        if let Err(e) = ch.join().await {
-            warnf!(self.log, "join ch failed:{}, but nothing to do", e);
-        }
+        infof!(self.log, "shutdown VMM and wait ch exit");
+        ch.shutdown().await?;
+        *self.state.lock().await = SandBoxState::Exited;
         infof!(self.log, "destroy sandbox finish");
         Ok(())
     }
@@ -1893,6 +1874,40 @@ mod tests {
     use super::Log;
     use super::SandBox;
     use super::SnapshotFreezeState;
+
+    #[tokio::test]
+    async fn destroy_without_agent_or_launched_vmm_is_idempotent() {
+        let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(8);
+        let mut sb = SandBox::new("failed-create".into(), Log::default(), false, tx);
+        assert!(sb.client.is_none());
+        sb.destroy_sandbox().await.unwrap();
+        sb.destroy_sandbox().await.unwrap();
+        assert!(*sb.state.lock().await == super::SandBoxState::Exited);
+    }
+
+    #[tokio::test]
+    async fn destroy_with_unresponsive_agent_and_missing_shutdown_event() {
+        let (client_fd, _peer_fd) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        // Keep the peer open but never answer DestroySandbox. No VMM event
+        // receiver is installed either, as in a partially initialized sandbox.
+        let client = ttrpc::r#async::Client::new(client_fd.into_raw_fd());
+        let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(8);
+        let mut sb = SandBox::new("unreachable-agent".into(), Log::default(), false, tx);
+        sb.client = Some(Arc::new(Mutex::new(agent_ttrpc::AgentServiceClient::new(
+            client,
+        ))));
+        tokio::time::timeout(std::time::Duration::from_secs(2), sb.destroy_sandbox())
+            .await
+            .expect("cleanup waited indefinitely for the agent/event")
+            .unwrap();
+        sb.destroy_sandbox().await.unwrap();
+    }
 
     #[tokio::test]
     async fn expired_snapshot_freeze_rejects_resume_and_renew() {

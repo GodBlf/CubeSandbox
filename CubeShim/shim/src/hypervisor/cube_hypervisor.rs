@@ -297,6 +297,31 @@ impl CubeHypervisor {
         ch.join().map_err(|e| format!("join ch failed:{}", e))
     }
 
+    /// Terminal teardown, including a VM whose agent was never connected.
+    /// VmmShutdown stops the VMM event loop; VmShutdown only stops the guest.
+    pub async fn shutdown(&mut self) -> CResult<()> {
+        let Some(instance) = self.ch.clone() else {
+            return Ok(());
+        };
+        let log = self.log.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut instance = instance.blocking_lock();
+            // A dead VMM may reject the request. Still join its finished thread.
+            let shutdown = instance.send_request(ApiRequest::VmmShutdown);
+            instance
+                .join()
+                .map_err(|e| format!("join ch failed:{}", e))?;
+            if let Err(e) = shutdown {
+                crate::warnf!(log, "VMM already stopped, shutdown request failed:{}", e);
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| format!("shutdown worker failed:{}", e))??;
+        self.ch = None;
+        Ok(())
+    }
+
     pub async fn pause_vm_cube(&self, path: &str) -> CResult<()> {
         self.pause_vm_cube_with_config(path, None, SnapshotType::Full)
             .await

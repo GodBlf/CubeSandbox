@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,7 @@ use protobuf::{Enum, Message};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 
+use super::termination;
 use crate::common::utils::Utils;
 use crate::container::{container_mgr::ContainerInfo, exec::Tty};
 use crate::log::{stat_defer, Log, LogLevel};
@@ -277,6 +279,7 @@ pub struct TaskService {
     log: Log,
     //debug: bool,
     exit: Arc<ExitSignal>,
+    terminating: Arc<AtomicBool>,
     tx_containerd: Sender<(String, Box<dyn MessageDyn>)>,
 }
 
@@ -307,6 +310,7 @@ impl TaskService {
             log,
             //debug: debug,
             exit,
+            terminating: Arc::new(AtomicBool::new(false)),
             tx_containerd: tx,
         }
     }
@@ -315,6 +319,90 @@ impl TaskService {
         self.tx_containerd
             .try_send((topic.clone(), event))
             .unwrap_or_else(|e| warnf!(self.log, "tx event:{} to publisher failed:{}", topic, e));
+    }
+
+    fn rollback_failed_create(&self) {
+        warnf!(
+            self.log,
+            "rolling back failed create; shim exit deadline is {}s",
+            termination::CLEANUP_TIMEOUT.as_secs()
+        );
+        termination::arm(&self.terminating, termination::CLEANUP_TIMEOUT);
+        let service = self.clone();
+        tokio::spawn(async move {
+            // Let the failed Create RPC return its original error before
+            // stopping the server. Cleanup does not depend on a later Shutdown.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut sb = service.sandbox.lock().await;
+            if let Err(e) = sb.destroy_sandbox().await {
+                errf!(service.log, "failed create rollback failed:{}", e);
+            }
+            service.exit.signal();
+        });
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    #[tokio::test]
+    async fn rollback_child() {
+        let Ok(mode) = std::env::var("CUBE_SHIM_ROLLBACK_TEST") else {
+            return;
+        };
+        let (tx, _) = channel(8);
+        let service = TaskService {
+            sandbox: Arc::new(Mutex::new(sb::SandBox::new(
+                "failed-create".into(),
+                Log::default(),
+                false,
+                tx.clone(),
+            ))),
+            log: Log::default(),
+            exit: Arc::new(ExitSignal::default()),
+            terminating: Arc::new(AtomicBool::new(false)),
+            tx_containerd: tx,
+        };
+        // Shorten only the child test's deadline. The production rollback must
+        // keep this first deadline even if Shutdown races with it.
+        termination::arm(&service.terminating, Duration::from_millis(500));
+        let guard = service.sandbox.lock().await;
+        service.rollback_failed_create();
+        if mode == "released" {
+            drop(guard);
+        }
+        service.exit.wait().await;
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn rollback_signals_exit_or_enforces_deadline_when_sandbox_lock_is_stuck() {
+        for (mode, code) in [("released", 0), ("blocked", 1)] {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "service::task_srv::cleanup_tests::rollback_child",
+                ])
+                .env("CUBE_SHIM_ROLLBACK_TEST", mode)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let start = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert_eq!(status.code(), Some(code), "{mode}");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(5) {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("failed-create rollback left a live shim: {mode}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 }
 
@@ -349,11 +437,15 @@ impl Task for TaskService {
         );
 
         let mut sb = self.sandbox.lock().await;
+        if self.terminating.load(Ordering::SeqCst) {
+            return Err(Others("sandbox is terminating".to_string()));
+        }
         if sb.paused().await {
             errf!(self.log, "sandbox not in normal state");
             return Err(Others(format!("sandbox not in normal state")));
         }
-        if !sb.inited() {
+        let new_sandbox = !sb.inited();
+        if new_sandbox {
             stat.set_callee_act(stat_defer::CALLEE_ACT_CREATE_POD_SANDBOX.to_string());
             infof!(self.log, "shim pid {}", std::process::id());
             if let Err(e) = Utils::record_pid() {
@@ -365,10 +457,11 @@ impl Task for TaskService {
                 Error::Other(format!("Init sandbox config failed:{}", e))
             })?;
 
-            sb.create_sandbox().await.map_err(|e| {
+            if let Err(e) = sb.create_sandbox().await {
                 errf!(self.log, "Create sandbox failed:{}", e.clone());
-                Error::Other(format!("Create sandbox failed:{}", e))
-            })?;
+                self.rollback_failed_create();
+                return Err(Error::Other(format!("Create sandbox failed:{}", e)).into());
+            }
         }
 
         infof!(
@@ -385,12 +478,13 @@ impl Task for TaskService {
             terminal: req.terminal,
             ..Default::default()
         };
-        sb.create_container(req.id.clone(), spec, info)
-            .await
-            .map_err(|e| {
-                errf!(self.log, "Create container failed:{}", e.clone());
-                Error::Other(format!("Create container failed:{}", e))
-            })?;
+        if let Err(e) = sb.create_container(req.id.clone(), spec, info).await {
+            errf!(self.log, "Create container failed:{}", e.clone());
+            if new_sandbox {
+                self.rollback_failed_create();
+            }
+            return Err(Error::Other(format!("Create container failed:{}", e)).into());
+        }
         infof!(
             self.log,
             "start container finish at:{}",
@@ -784,6 +878,7 @@ impl Task for TaskService {
             return Ok(api::Empty::default());
         }
         if !already_paused {
+            termination::arm(&self.terminating, termination::CLEANUP_TIMEOUT);
             if let Err(e) = sb.destroy_sandbox().await {
                 errf!(self.log, "shutdown failed:{}", e)
             } else {

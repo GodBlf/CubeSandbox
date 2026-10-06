@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -279,7 +278,7 @@ pub struct TaskService {
     log: Log,
     //debug: bool,
     exit: Arc<ExitSignal>,
-    terminating: Arc<AtomicBool>,
+    terminating: Arc<termination::Deadline>,
     tx_containerd: Sender<(String, Box<dyn MessageDyn>)>,
 }
 
@@ -310,7 +309,7 @@ impl TaskService {
             log,
             //debug: debug,
             exit,
-            terminating: Arc::new(AtomicBool::new(false)),
+            terminating: Arc::new(termination::Deadline::default()),
             tx_containerd: tx,
         }
     }
@@ -327,7 +326,7 @@ impl TaskService {
             "rolling back failed create; shim exit deadline is {}s",
             termination::CLEANUP_TIMEOUT.as_secs()
         );
-        termination::arm(&self.terminating, termination::CLEANUP_TIMEOUT);
+        self.terminating.arm(termination::CLEANUP_TIMEOUT);
         let service = self.clone();
         tokio::spawn(async move {
             // Let the failed Create RPC return its original error before
@@ -336,6 +335,8 @@ impl TaskService {
             let mut sb = service.sandbox.lock().await;
             if let Err(e) = sb.destroy_sandbox().await {
                 errf!(service.log, "failed create rollback failed:{}", e);
+            } else {
+                service.terminating.cleanup_complete();
             }
             service.exit.signal();
         });
@@ -362,12 +363,12 @@ mod cleanup_tests {
             ))),
             log: Log::default(),
             exit: Arc::new(ExitSignal::default()),
-            terminating: Arc::new(AtomicBool::new(false)),
+            terminating: Arc::new(termination::Deadline::default()),
             tx_containerd: tx,
         };
         // Shorten only the child test's deadline. The production rollback must
         // keep this first deadline even if Shutdown races with it.
-        termination::arm(&service.terminating, Duration::from_millis(500));
+        service.terminating.arm(Duration::from_millis(500));
         let guard = service.sandbox.lock().await;
         service.rollback_failed_create();
         if mode == "released" {
@@ -437,7 +438,7 @@ impl Task for TaskService {
         );
 
         let mut sb = self.sandbox.lock().await;
-        if self.terminating.load(Ordering::SeqCst) {
+        if self.terminating.is_armed() {
             return Err(Others("sandbox is terminating".to_string()));
         }
         if sb.paused().await {
@@ -878,10 +879,11 @@ impl Task for TaskService {
             return Ok(api::Empty::default());
         }
         if !already_paused {
-            termination::arm(&self.terminating, termination::CLEANUP_TIMEOUT);
+            self.terminating.arm(termination::CLEANUP_TIMEOUT);
             if let Err(e) = sb.destroy_sandbox().await {
                 errf!(self.log, "shutdown failed:{}", e)
             } else {
+                self.terminating.cleanup_complete();
                 infof!(self.log, "shutdown req finish");
             }
         } else {

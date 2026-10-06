@@ -756,6 +756,8 @@ impl SandBox {
         containers.is_empty()
     }
 
+    /// Terminal teardown. Callers must arm a process-exit deadline before
+    /// entering: VMM API requests, joins and mutex acquisition can block.
     pub async fn destroy_sandbox(&mut self) -> CResult<()> {
         infof!(self.log, "destroy sandbox start");
         let req = agent::DestroySandboxRequest {
@@ -764,6 +766,7 @@ impl SandBox {
 
         if self.ch.is_none() {
             infof!(self.log, "ch instance is None");
+            *self.state.lock().await = SandBoxState::Exited;
             return Ok(());
         }
         // Stop competing event consumers before waiting for VmShutdown.
@@ -787,22 +790,19 @@ impl SandBox {
                 {
                     warnf!(self.log, "destroy guest sandbox failed:{}", e);
                 }
-                let deadline = Instant::now() + Duration::from_secs(1);
-                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-                    match ch.wait_notify(remaining).await {
-                        Ok(CH::NotifyEvent::VmShutdown) => break,
-                        Ok(_) => continue,
-                        Err(e) => {
-                            warnf!(self.log, "wait vm shutdown failed:{}, stopping VMM", e);
-                            break;
-                        }
-                    }
+                if let Err(e) = ch.wait_vm_shutdown(Duration::from_secs(1)).await {
+                    warnf!(self.log, "wait vm shutdown failed:{}, stopping VMM", e);
                 }
             }
         }
         infof!(self.log, "shutdown VMM and wait ch exit");
         ch.shutdown().await?;
+        drop(ch);
+        self.ch = None;
         *self.state.lock().await = SandBoxState::Exited;
+        for container in self.containers.lock().await.values() {
+            container.notify_vm_shutdown().await;
+        }
         infof!(self.log, "destroy sandbox finish");
         Ok(())
     }
@@ -1881,6 +1881,7 @@ mod tests {
         let mut sb = SandBox::new("failed-create".into(), Log::default(), false, tx);
         assert!(sb.client.is_none());
         sb.destroy_sandbox().await.unwrap();
+        assert!(sb.ch.is_none());
         sb.destroy_sandbox().await.unwrap();
         assert!(*sb.state.lock().await == super::SandBoxState::Exited);
     }

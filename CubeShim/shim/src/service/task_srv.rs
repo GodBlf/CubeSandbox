@@ -320,13 +320,23 @@ impl TaskService {
             .unwrap_or_else(|e| warnf!(self.log, "tx event:{} to publisher failed:{}", topic, e));
     }
 
+    fn arm_deadline(&self) {
+        if let Err(e) = self.terminating.arm(termination::CLEANUP_TIMEOUT) {
+            warnf!(
+                self.log,
+                "cannot start shim exit watchdog:{}; continuing cleanup without enforced deadline",
+                e
+            );
+        }
+    }
+
     fn rollback_failed_create(&self) {
         warnf!(
             self.log,
             "rolling back failed create; shim exit deadline is {}s",
             termination::CLEANUP_TIMEOUT.as_secs()
         );
-        self.terminating.arm(termination::CLEANUP_TIMEOUT);
+        self.arm_deadline();
         let service = self.clone();
         tokio::spawn(async move {
             // Let the failed Create RPC return its original error before
@@ -368,7 +378,7 @@ mod cleanup_tests {
         };
         // Shorten only the child test's deadline. The production rollback must
         // keep this first deadline even if Shutdown races with it.
-        service.terminating.arm(Duration::from_millis(500));
+        service.terminating.arm(Duration::from_secs(2)).unwrap();
         let guard = service.sandbox.lock().await;
         service.rollback_failed_create();
         if mode == "released" {
@@ -445,8 +455,7 @@ impl Task for TaskService {
             errf!(self.log, "sandbox not in normal state");
             return Err(Others(format!("sandbox not in normal state")));
         }
-        let new_sandbox = !sb.inited();
-        if new_sandbox {
+        if !sb.inited() {
             stat.set_callee_act(stat_defer::CALLEE_ACT_CREATE_POD_SANDBOX.to_string());
             infof!(self.log, "shim pid {}", std::process::id());
             if let Err(e) = Utils::record_pid() {
@@ -481,9 +490,8 @@ impl Task for TaskService {
         };
         if let Err(e) = sb.create_container(req.id.clone(), spec, info).await {
             errf!(self.log, "Create container failed:{}", e.clone());
-            if new_sandbox {
-                self.rollback_failed_create();
-            }
+            // A successful CreateSandbox is reusable after a container-level
+            // error. Leave its lifetime to Cubelet's retry/Shutdown policy.
             return Err(Error::Other(format!("Create container failed:{}", e)).into());
         }
         infof!(
@@ -879,7 +887,7 @@ impl Task for TaskService {
             return Ok(api::Empty::default());
         }
         if !already_paused {
-            self.terminating.arm(termination::CLEANUP_TIMEOUT);
+            self.arm_deadline();
             if let Err(e) = sb.destroy_sandbox().await {
                 errf!(self.log, "shutdown failed:{}", e)
             } else {

@@ -316,8 +316,35 @@ impl SandBox {
         }
         false
     }
+    async fn stop_background_tasks(&mut self) {
+        if let Some(tx) = self.tx_monitor_exited.as_ref() {
+            let _ = tx.try_send(());
+        }
+        tokio::task::yield_now().await;
+
+        if let Some(handle) = self.monitor_handle.take() {
+            handle.abort();
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        //stop watch oom event
+        if let Some(tx) = self.tx_oom_exited.as_ref() {
+            let _ = tx.try_send(());
+        }
+        tokio::task::yield_now().await;
+
+        if let Some(handle) = self.oom_handle.take() {
+            handle.abort();
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
     async fn disconnect_agent(&mut self) -> CResult<()> {
-        self.stop_watchers().await;
+        self.stop_background_tasks().await;
 
         let mut containers = self.containers.lock().await;
         for (_, c) in containers.iter_mut() {
@@ -769,13 +796,9 @@ impl SandBox {
             *self.state.lock().await = SandBoxState::Exited;
             return Ok(());
         }
-        // Stop competing event consumers before waiting for VmShutdown.
-        if let Some(handle) = self.monitor_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.oom_handle.take() {
-            handle.abort();
-        }
+        // Signal before cancellation, then give aborted tasks a chance to
+        // release their in-flight agent streams before DestroySandbox.
+        self.stop_background_tasks().await;
         let mut ch = self.ch.as_ref().unwrap().lock().await;
         let exited = *self.state.lock().await == SandBoxState::Exited;
         if !exited {
@@ -796,15 +819,25 @@ impl SandBox {
             }
         }
         infof!(self.log, "shutdown VMM and wait ch exit");
-        ch.shutdown().await?;
+        let result = ch.shutdown().await;
         drop(ch);
-        self.ch = None;
+        self.finish_destroy(result).await
+    }
+
+    async fn finish_destroy(&mut self, result: CResult<()>) -> CResult<()> {
+        // A worker panic does not prove VMM death. Keep the handle so a later
+        // terminal cleanup can retry, but make the sandbox unavailable and
+        // notify waiters regardless. Callers must not mark cleanup complete
+        // until the VMM join was confirmed by a successful result.
+        if result.is_ok() {
+            self.ch = None;
+        }
         *self.state.lock().await = SandBoxState::Exited;
         for container in self.containers.lock().await.values() {
             container.notify_vm_shutdown().await;
         }
         infof!(self.log, "destroy sandbox finish");
-        Ok(())
+        result
     }
 
     pub async fn prepare_resource(&mut self) -> CResult<VmConfig> {
@@ -1884,6 +1917,53 @@ mod tests {
         assert!(sb.ch.is_none());
         sb.destroy_sandbox().await.unwrap();
         assert!(*sb.state.lock().await == super::SandBoxState::Exited);
+    }
+
+    #[tokio::test]
+    async fn worker_failure_finalizes_state_but_keeps_runtime_for_retry() {
+        let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(8);
+        let mut sb = SandBox::new("failed-worker".into(), Log::default(), false, tx);
+        assert!(sb
+            .finish_destroy(Err("injected worker panic".into()))
+            .await
+            .is_err());
+        assert!(*sb.state.lock().await == super::SandBoxState::Exited);
+        assert!(
+            sb.ch.is_some(),
+            "unconfirmed runtime must remain available for teardown"
+        );
+        sb.destroy_sandbox().await.unwrap();
+        assert!(sb.ch.is_none());
+        sb.destroy_sandbox().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_background_tasks_waits_for_agent_clones_to_drop() {
+        let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(8);
+        let mut sb = SandBox::new("stop-consumers".into(), Log::default(), false, tx);
+        let owner = Arc::new(());
+        for oom in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let client_clone = owner.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let handle = Arc::new(tokio::spawn(async move {
+                let _client = client_clone;
+                ready_tx.send(()).unwrap();
+                rx.recv().await;
+            }));
+            ready_rx.await.unwrap();
+            if oom {
+                sb.tx_oom_exited = Some(tx);
+                sb.oom_handle = Some(handle);
+            } else {
+                sb.tx_monitor_exited = Some(tx);
+                sb.monitor_handle = Some(handle);
+            }
+        }
+        assert_eq!(Arc::strong_count(&owner), 3);
+        sb.stop_background_tasks().await;
+        assert_eq!(Arc::strong_count(&owner), 1);
+        assert!(sb.monitor_handle.is_none() && sb.oom_handle.is_none());
     }
 
     #[tokio::test]

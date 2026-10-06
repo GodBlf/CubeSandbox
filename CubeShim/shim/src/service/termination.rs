@@ -10,6 +10,8 @@ pub(super) const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Once terminal cleanup starts, this process must exit even if an embedded
 /// VMM API request, a lock, or a synchronous thread join never returns.
 /// A Tokio timer cannot enforce that deadline when its workers are blocked.
+/// If a native thread cannot be started, return the error so the caller can
+/// log the lost deadline guarantee and still attempt normal cleanup.
 #[derive(Default)]
 pub(super) struct Deadline {
     armed: AtomicBool,
@@ -25,32 +27,37 @@ impl Deadline {
         self.cleaned.store(true, Ordering::SeqCst);
     }
 
-    pub(super) fn arm(self: &Arc<Self>, timeout: Duration) {
+    pub(super) fn arm(self: &Arc<Self>, timeout: Duration) -> std::io::Result<()> {
+        self.arm_with(timeout, |work| {
+            std::thread::Builder::new()
+                .name("shim-exit-deadline".into())
+                .spawn(work)
+                .map(|_| ())
+        })
+    }
+
+    fn arm_with(
+        self: &Arc<Self>,
+        timeout: Duration,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         if self.armed.swap(true, Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
         let deadline = self.clone();
-        if std::thread::Builder::new()
-            .name("shim-exit-deadline".into())
-            .spawn(move || {
-                std::thread::sleep(timeout);
-                // Do not run destructors/atexit handlers: VmmInstance::drop can
-                // block on the same VMM API or join that prevented cleanup.
-                // Exiting the whole process closes the embedded VM's descriptors
-                // before Cubelet can observe process death and reclaim resources.
-                let code = if deadline.cleaned.load(Ordering::SeqCst) {
-                    0
-                } else {
-                    1
-                };
-                unsafe { libc::_exit(code) }
-            })
-            .is_err()
-        {
-            // Without a watchdog we cannot guarantee reclamation of this terminal
-            // shim. Avoid a core dump on an already resource-constrained host.
-            unsafe { libc::_exit(1) }
-        }
+        spawn(Box::new(move || {
+            std::thread::sleep(timeout);
+            // Do not run destructors/atexit handlers: VmmInstance::drop can
+            // block on the same VMM API or join that prevented cleanup.
+            // Exiting the whole process closes the embedded VM's descriptors
+            // before Cubelet can observe process death and reclaim resources.
+            let code = if deadline.cleaned.load(Ordering::SeqCst) {
+                0
+            } else {
+                1
+            };
+            unsafe { libc::_exit(code) }
+        }))
     }
 }
 
@@ -66,9 +73,9 @@ mod tests {
             return;
         };
         let terminating = Arc::new(Deadline::default());
-        terminating.arm(Duration::from_millis(100));
+        terminating.arm(Duration::from_millis(100)).unwrap();
         // A duplicate shutdown must not extend the original deadline.
-        terminating.arm(Duration::from_secs(60));
+        terminating.arm(Duration::from_secs(60)).unwrap();
         assert!(terminating.is_armed());
         if mode == "cleaned-but-blocked" {
             terminating.cleanup_complete();
@@ -119,5 +126,17 @@ mod tests {
     #[test]
     fn completed_cleanup_with_stalled_process_exit_returns_success() {
         assert_eq!(run_child("cleaned-but-blocked").code(), Some(0));
+    }
+
+    #[test]
+    fn watchdog_spawn_failure_allows_terminal_cleanup_to_continue() {
+        let deadline = Arc::new(Deadline::default());
+        let result = deadline.arm_with(Duration::from_secs(10), |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+        });
+        assert!(result.is_err());
+        assert!(deadline.is_armed());
+        deadline.cleanup_complete();
+        assert!(deadline.cleaned.load(Ordering::SeqCst));
     }
 }

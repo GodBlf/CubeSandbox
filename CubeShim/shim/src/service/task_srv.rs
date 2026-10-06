@@ -330,6 +330,57 @@ impl TaskService {
         }
     }
 
+    async fn shutdown_sandbox(&self, timeout: Duration) -> TtrpcResult<api::Empty> {
+        infof!(self.log, "shutdown req start");
+        // The probe covers lock acquisition too, but is cancelled if Shutdown
+        // discovers a live sandbox with containers that must be kept running.
+        let probe = self
+            .terminating
+            .probe(timeout)
+            .map_err(|e| {
+                warnf!(
+                    self.log,
+                    "cannot start shutdown probe:{}; continuing cleanup",
+                    e
+                );
+                e
+            })
+            .ok();
+        let mut sb = self.sandbox.lock().await;
+        // After PauseToSnapshot the sandbox is Paused (MicroVM already gone).
+        // Allow shutdown so Cubelet can reap the shim; skip destroy_sandbox
+        // when already paused because there is no live VM to tear down.
+        let already_paused = sb.paused().await;
+        if !already_paused && !sb.is_empty().await {
+            infof!(
+                self.log,
+                "sandbox not empty, do nothing, shutdown req finish"
+            );
+            return Ok(api::Empty::default());
+        }
+        if let Some(probe) = probe {
+            probe.commit();
+        } else {
+            self.arm_deadline();
+        }
+        if !already_paused {
+            if let Err(e) = sb.destroy_sandbox().await {
+                errf!(self.log, "shutdown failed:{}", e)
+            } else {
+                self.terminating.cleanup_complete();
+                infof!(self.log, "shutdown req finish");
+            }
+        } else {
+            self.terminating.cleanup_complete();
+            infof!(
+                self.log,
+                "shutdown after pause-to-snapshot; signaling shim exit"
+            );
+        }
+        self.exit.signal();
+        Ok(api::Empty::default())
+    }
+
     fn rollback_failed_create(&self) {
         warnf!(
             self.log,
@@ -376,6 +427,24 @@ mod cleanup_tests {
             terminating: Arc::new(termination::Deadline::default()),
             tx_containerd: tx,
         };
+        if mode == "shutdown-blocked" {
+            let _guard = service.sandbox.lock().await;
+            // Exercise the production Shutdown helper with its lock held;
+            // no rollback deadline has been pre-armed in this child.
+            service
+                .shutdown_sandbox(Duration::from_millis(300))
+                .await
+                .unwrap();
+            std::process::exit(0);
+        }
+        if mode == "shutdown-clean" {
+            service
+                .shutdown_sandbox(Duration::from_millis(300))
+                .await
+                .unwrap();
+            // Simulate a stalled shim exit sequence after successful cleanup.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
         // Shorten only the child test's deadline. The production rollback must
         // keep this first deadline even if Shutdown races with it.
         service.terminating.arm(Duration::from_secs(2)).unwrap();
@@ -390,7 +459,12 @@ mod cleanup_tests {
 
     #[test]
     fn rollback_signals_exit_or_enforces_deadline_when_sandbox_lock_is_stuck() {
-        for (mode, code) in [("released", 0), ("blocked", 1)] {
+        for (mode, code) in [
+            ("released", 0),
+            ("blocked", 1),
+            ("shutdown-blocked", 1),
+            ("shutdown-clean", 0),
+        ] {
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -872,38 +946,8 @@ impl Task for TaskService {
         _ctx: &TtrpcContext,
         _req: api::ShutdownRequest,
     ) -> TtrpcResult<api::Empty> {
-        infof!(self.log, "shutdown req start");
-
-        let mut sb = self.sandbox.lock().await;
-        // After PauseToSnapshot the sandbox is Paused (MicroVM already gone).
-        // Allow shutdown so Cubelet can reap the shim; skip destroy_sandbox
-        // when already paused because there is no live VM to tear down.
-        let already_paused = sb.paused().await;
-        if !already_paused && !sb.is_empty().await {
-            infof!(
-                self.log,
-                "sandbox not empty, do nothing, shutdown req finish"
-            );
-            return Ok(api::Empty::default());
-        }
-        if !already_paused {
-            self.arm_deadline();
-            if let Err(e) = sb.destroy_sandbox().await {
-                errf!(self.log, "shutdown failed:{}", e)
-            } else {
-                self.terminating.cleanup_complete();
-                infof!(self.log, "shutdown req finish");
-            }
-        } else {
-            infof!(
-                self.log,
-                "shutdown after pause-to-snapshot; signaling shim exit"
-            );
-        }
-        self.exit.signal();
-        Ok(api::Empty::default())
+        self.shutdown_sandbox(termination::CLEANUP_TIMEOUT).await
     }
-
     async fn state(
         &self,
         _ctx: &TtrpcContext,

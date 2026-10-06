@@ -295,8 +295,14 @@ impl CubeHypervisor {
     pub async fn wait_vm_shutdown(&self, timeout: Duration) -> CResult<()> {
         let deadline = std::time::Instant::now() + timeout;
         while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
-            if self.wait_notify(remaining).await? == NotifyEvent::VmShutdown {
-                return Ok(());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.wait_notify(remaining).await {
+                Ok(NotifyEvent::VmShutdown) => return Ok(()),
+                Ok(_) => {}
+                Err(_) if std::time::Instant::now() >= deadline => break,
+                Err(e) => return Err(e),
             }
         }
         Err("VM shutdown event deadline expired".into())

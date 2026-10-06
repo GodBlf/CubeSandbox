@@ -323,10 +323,7 @@ impl SandBox {
         tokio::task::yield_now().await;
 
         if let Some(handle) = self.monitor_handle.take() {
-            handle.abort();
-            while !handle.is_finished() {
-                tokio::task::yield_now().await;
-            }
+            self.stop_background_task(handle).await;
         }
 
         //stop watch oom event
@@ -336,10 +333,30 @@ impl SandBox {
         tokio::task::yield_now().await;
 
         if let Some(handle) = self.oom_handle.take() {
-            handle.abort();
-            while !handle.is_finished() {
-                tokio::task::yield_now().await;
+            self.stop_background_task(handle).await;
+        }
+    }
+
+    async fn stop_background_task(&self, handle: Arc<tokio::task::JoinHandle<()>>) {
+        handle.abort();
+        let stopped = tokio::time::timeout(Duration::from_millis(200), async move {
+            match Arc::try_unwrap(handle) {
+                Ok(handle) => {
+                    let _ = handle.await;
+                }
+                Err(handle) => {
+                    while !handle.is_finished() {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }
             }
+        })
+        .await;
+        if stopped.is_err() {
+            warnf!(
+                self.log,
+                "background task cancellation timed out; continuing cleanup"
+            );
         }
     }
 
@@ -1917,6 +1934,25 @@ mod tests {
         assert!(sb.ch.is_none());
         sb.destroy_sandbox().await.unwrap();
         assert!(*sb.state.lock().await == super::SandBoxState::Exited);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_noncancellable_background_task_has_a_bound() {
+        let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(8);
+        let sb = SandBox::new("blocked-background".into(), Log::default(), false, tx);
+        for cloned in [false, true] {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let handle = Arc::new(tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            }));
+            ready.await.unwrap();
+            let keep = if cloned { Some(handle.clone()) } else { None };
+            let start = std::time::Instant::now();
+            sb.stop_background_task(handle).await;
+            assert!(start.elapsed() < std::time::Duration::from_millis(500));
+            drop(keep);
+        }
     }
 
     #[tokio::test]

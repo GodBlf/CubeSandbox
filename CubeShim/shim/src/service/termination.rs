@@ -19,30 +19,6 @@ pub(super) struct Deadline {
 }
 
 impl Deadline {
-    /// Cover Shutdown's lock/state checks without committing a live sandbox
-    /// to termination. Dropping the probe cancels only its own watchdog.
-    pub(super) fn probe(self: &Arc<Self>, timeout: Duration) -> std::io::Result<Probe> {
-        let active = Arc::new(AtomicBool::new(true));
-        let probe = Probe {
-            active: active.clone(),
-            deadline: self.clone(),
-        };
-        let deadline = self.clone();
-        std::thread::Builder::new()
-            .name("shim-shutdown-probe".into())
-            .spawn(move || {
-                std::thread::sleep(timeout);
-                if active.load(Ordering::SeqCst) {
-                    let code = if deadline.cleaned.load(Ordering::SeqCst) {
-                        0
-                    } else {
-                        1
-                    };
-                    unsafe { libc::_exit(code) }
-                }
-            })?;
-        Ok(probe)
-    }
     pub(super) fn is_armed(&self) -> bool {
         self.armed.load(Ordering::SeqCst)
     }
@@ -87,26 +63,6 @@ impl Deadline {
     }
 }
 
-pub(super) struct Probe {
-    active: Arc<AtomicBool>,
-    deadline: Arc<Deadline>,
-}
-
-impl Probe {
-    /// Lock checks have finished. Cancel their watchdog and give teardown its
-    /// own full budget. An already armed rollback keeps its original deadline.
-    pub(super) fn commit(self, timeout: Duration) -> std::io::Result<()> {
-        self.active.store(false, Ordering::SeqCst);
-        self.deadline.arm(timeout)
-    }
-}
-
-impl Drop for Probe {
-    fn drop(&mut self) {
-        self.active.store(false, Ordering::SeqCst);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,28 +81,6 @@ mod tests {
             .write_all(b"deadline-child-started\n")
             .unwrap();
         let terminating = Arc::new(Deadline::default());
-        if mode == "cancel-probe" || mode == "commit-probe" || mode == "refresh-probe" {
-            let probe = terminating.probe(Duration::from_millis(100)).unwrap();
-            if mode == "cancel-probe" {
-                drop(probe);
-                std::thread::sleep(Duration::from_millis(200));
-                assert!(!terminating.is_armed());
-                std::process::exit(0);
-            }
-            probe
-                .commit(if mode == "refresh-probe" {
-                    Duration::from_millis(400)
-                } else {
-                    Duration::from_millis(100)
-                })
-                .unwrap();
-            assert!(terminating.is_armed());
-            if mode == "refresh-probe" {
-                std::thread::sleep(Duration::from_millis(250));
-                std::process::exit(0);
-            }
-            std::thread::sleep(Duration::from_secs(60));
-        }
         terminating.arm(Duration::from_millis(100)).unwrap();
         // A duplicate shutdown must not extend the original deadline.
         terminating.arm(Duration::from_secs(60)).unwrap();
@@ -206,13 +140,6 @@ mod tests {
     #[test]
     fn graceful_exit_precedes_deadline() {
         assert!(run_child("clean").success());
-    }
-
-    #[test]
-    fn shutdown_probe_can_cancel_or_start_a_fresh_cleanup_budget() {
-        assert_eq!(run_child("cancel-probe").code(), Some(0));
-        assert_eq!(run_child("commit-probe").code(), Some(1));
-        assert_eq!(run_child("refresh-probe").code(), Some(0));
     }
 
     #[test]

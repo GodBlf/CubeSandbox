@@ -317,22 +317,7 @@ impl SandBox {
         false
     }
     async fn stop_background_tasks(&mut self) {
-        if let Some(tx) = self.tx_monitor_exited.as_ref() {
-            let _ = tx.try_send(());
-        }
-        tokio::task::yield_now().await;
-
-        if let Some(handle) = self.monitor_handle.take() {
-            self.stop_background_task(handle).await;
-        }
-
-        //stop watch oom event
-        if let Some(tx) = self.tx_oom_exited.as_ref() {
-            let _ = tx.try_send(());
-        }
-        tokio::task::yield_now().await;
-
-        if let Some(handle) = self.oom_handle.take() {
+        for handle in self.stop_watchers().await {
             self.stop_background_task(handle).await;
         }
     }
@@ -385,16 +370,20 @@ impl SandBox {
         }
     }
 
-    /// Stop the monitor / oom watcher tasks; shared by quiesce (pause) and
-    /// disconnect (rollback): whatever holds a clone of the agent client must
-    /// be stopped before the connection is dealt with.
-    async fn stop_watchers(&mut self) {
+    /// Signal the monitor / oom watcher tasks and abort them, returning the
+    /// aborted handles. Whatever holds a clone of the agent client must be
+    /// stopped before the connection is dealt with. Pause's quiesce path
+    /// stops here (wait-free); terminal teardown bounds the cancellation of
+    /// the returned handles via stop_background_tasks.
+    async fn stop_watchers(&mut self) -> Vec<Arc<tokio::task::JoinHandle<()>>> {
+        let mut stopped = Vec::new();
         //stop monitor
         if let Some(tx) = self.tx_monitor_exited.as_ref() {
             let _ = tx.try_send(());
         }
         if let Some(handle) = self.monitor_handle.take() {
             handle.abort();
+            stopped.push(handle);
         }
         //stop watch oom event
         if let Some(tx) = self.tx_oom_exited.as_ref() {
@@ -402,7 +391,9 @@ impl SandBox {
         }
         if let Some(handle) = self.oom_handle.take() {
             handle.abort();
+            stopped.push(handle);
         }
+        stopped
     }
 
     /// Signal every container's init log forwarders to stop without waiting:
